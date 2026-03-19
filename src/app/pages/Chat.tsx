@@ -10,7 +10,6 @@ import {
 import {
   getAgentStatus,
   getChatHistory,
-  sendTaskToAgent,
   clearChatHistory,
   getAvailableModels,
   getConfig,
@@ -20,6 +19,9 @@ import {
   type ToolCall,
   type OllamaModel,
 } from "../lib/api";
+
+const API_BASE_URL =
+  (import.meta.env.VITE_API_BASE_URL as string) || "http://localhost:8000/api";
 
 const AGENT_ICONS: Record<string, React.ElementType> = {
   "agent-chief-001": Brain,
@@ -72,6 +74,23 @@ const TOOL_LABEL_MAP: Record<string, string> = {
   http_request: "HTTP",
   get_system_info: "Sistem Bilgisi",
 };
+
+function LiveToolBlock({ tc }: { tc: ToolCall }) {
+  const Icon = TOOL_ICON_MAP[tc.name] ?? Terminal;
+  const label = TOOL_LABEL_MAP[tc.name] ?? tc.name;
+  const pending = tc.result === "";
+  return (
+    <div className={`mt-1 rounded-lg border text-xs font-mono px-3 py-2 flex items-center gap-2 ${
+      pending ? "border-blue-400/30 bg-blue-400/5" : "border-green-400/30 bg-green-400/5"
+    }`}>
+      {pending
+        ? <Loader2 className="w-3 h-3 text-blue-400 animate-spin flex-shrink-0" />
+        : <Icon className="w-3 h-3 text-green-400 flex-shrink-0" />}
+      <span className={pending ? "text-blue-400" : "text-green-400"}>{label}</span>
+      {!pending && <span className="text-muted-foreground truncate opacity-60">{tc.result.slice(0, 60)}</span>}
+    </div>
+  );
+}
 
 function ToolCallBlock({ tc }: { tc: ToolCall }) {
   const [open, setOpen] = useState(false);
@@ -133,6 +152,7 @@ export default function Chat() {
   const [history, setHistory] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState("");
   const [sending, setSending] = useState(false);
+  const [liveTools, setLiveTools] = useState<ToolCall[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [models, setModels] = useState<OllamaModel[]>([]);
   const [activeModel, setActiveModelState] = useState<string>("");
@@ -140,6 +160,7 @@ export default function Chat() {
   const [modelChanging, setModelChanging] = useState(false);
   const bottomRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
+  const abortRef = useRef<AbortController | null>(null);
 
   // Agent listesi + model listesi yükle
   useEffect(() => {
@@ -167,9 +188,15 @@ export default function Chat() {
   // Seçilen agentın chat geçmişini yükle
   useEffect(() => {
     setHistory([]);
+    setLiveTools([]);
     setError(null);
     getChatHistory(selectedId).then(setHistory).catch(() => {});
   }, [selectedId]);
+
+  // Unmount'ta streaming bağlantısını kapat
+  useEffect(() => {
+    return () => { abortRef.current?.abort(); };
+  }, []);
 
   // Yeni mesaj gelince en alta kaydır
   useEffect(() => {
@@ -185,7 +212,6 @@ export default function Chat() {
     const msg = input.trim();
     if (!msg || sending) return;
 
-    // Kullanıcı mesajını anında göster
     const userMsg: ChatMessage = {
       role: "user",
       content: msg,
@@ -195,26 +221,73 @@ export default function Chat() {
     setHistory((prev) => [...prev, userMsg]);
     setInput("");
     setSending(true);
+    setLiveTools([]);
     setError(null);
 
+    const ctrl = new AbortController();
+    abortRef.current = ctrl;
+
     try {
-      const result = await sendTaskToAgent(selectedId, msg);
-      const assistantMsg: ChatMessage = {
-        role: "assistant",
-        content: result.reply,
-        timestamp: new Date().toISOString(),
-        time: "şimdi",
-        tool_calls: result.tool_calls,
-      };
-      setHistory((prev) => [...prev, assistantMsg]);
-      // Güncel geçmişi sunucudan çek
-      getChatHistory(selectedId).then(setHistory).catch(() => {});
+      const res = await fetch(`${API_BASE_URL}/agents/${selectedId}/stream`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ message: msg, max_tokens: 4096 }),
+        signal: ctrl.signal,
+      });
+
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
+      const reader = res.body!.getReader();
+      const dec = new TextDecoder();
+      let buf = "";
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += dec.decode(value, { stream: true });
+
+        const lines = buf.split("\n");
+        buf = lines.pop()!;
+
+        for (const line of lines) {
+          if (!line.startsWith("data: ")) continue;
+          try {
+            const ev = JSON.parse(line.slice(6));
+
+            if (ev.type === "tool_start") {
+              setLiveTools((prev) => [...prev, { name: ev.name, args: ev.args ?? {}, result: "" }]);
+            } else if (ev.type === "tool_done") {
+              setLiveTools((prev) => {
+                const idx = [...prev].reverse().findIndex((t) => t.name === ev.name && t.result === "");
+                if (idx === -1) return prev;
+                const real = prev.length - 1 - idx;
+                return prev.map((t, i) => (i === real ? { ...t, result: ev.result ?? "" } : t));
+              });
+            } else if (ev.type === "reply") {
+              const assistantMsg: ChatMessage = {
+                role: "assistant",
+                content: ev.content,
+                timestamp: new Date().toISOString(),
+                time: "şimdi",
+                tool_calls: ev.tool_calls ?? [],
+              };
+              setHistory((prev) => [...prev, assistantMsg]);
+              setLiveTools([]);
+            } else if (ev.type === "error") {
+              setError(ev.message ?? "Bir hata oluştu");
+            }
+          } catch { /* malformed event — skip */ }
+        }
+      }
     } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : "Bir hata oluştu");
-      // Başarısız kullanıcı mesajını kaldır
-      setHistory((prev) => prev.filter((m) => m !== userMsg));
+      if (e instanceof Error && e.name !== "AbortError") {
+        setError(e.message);
+        setHistory((prev) => prev.filter((m) => m !== userMsg));
+      }
     } finally {
       setSending(false);
+      setLiveTools([]);
+      abortRef.current = null;
       inputRef.current?.focus();
     }
   }
@@ -365,21 +438,33 @@ export default function Chat() {
               ))}
             </AnimatePresence>
 
-            {/* Typing / tool execution indicator */}
+            {/* Canlı işlem göstergesi */}
             {sending && (
               <motion.div
                 initial={{ opacity: 0, y: 10 }}
                 animate={{ opacity: 1, y: 0 }}
                 className="flex justify-start"
               >
-                <div className="bg-background/60 border border-border/50 rounded-2xl rounded-tl-sm px-4 py-3">
+                <div className="bg-background/60 border border-border/50 rounded-2xl rounded-tl-sm px-4 py-3 max-w-[85%]">
+                  {/* Canlı tool call'lar */}
+                  {liveTools.length > 0 && (
+                    <div className="mb-2 space-y-1">
+                      {liveTools.map((tc, i) => (
+                        <LiveToolBlock key={i} tc={tc} />
+                      ))}
+                    </div>
+                  )}
                   <div className="flex items-center gap-2">
                     <div className="flex items-center gap-1">
                       <span className="w-2 h-2 rounded-full bg-primary animate-bounce" style={{ animationDelay: "0ms" }} />
                       <span className="w-2 h-2 rounded-full bg-primary animate-bounce" style={{ animationDelay: "150ms" }} />
                       <span className="w-2 h-2 rounded-full bg-primary animate-bounce" style={{ animationDelay: "300ms" }} />
                     </div>
-                    <span className="text-xs text-muted-foreground">Düşünüyor & tool kullanıyor...</span>
+                    <span className="text-xs text-muted-foreground">
+                      {liveTools.some(t => t.result === "")
+                        ? `${TOOL_LABEL_MAP[liveTools.findLast(t => t.result === "")?.name ?? ""] ?? "Tool"} çalışıyor...`
+                        : "Düşünüyor..."}
+                    </span>
                   </div>
                 </div>
               </motion.div>

@@ -223,6 +223,9 @@ AGENTS: list[dict] = [
 _chat_history: dict[str, list[dict]] = {a["id"]: [] for a in AGENTS}
 _activity_log: list[dict] = []
 
+# SSE streaming — her agent için aktif kuyruk
+_agent_stream_queue: dict[str, "asyncio.Queue | None"] = {a["id"]: None for a in AGENTS}
+
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -333,6 +336,7 @@ class OllamaClient:
         """
         Tool'u calistir. delegate_to_agent icin sub-message gonder.
         Dairesel delegasyonu onlemek icin _send_sub_message kullanir.
+        SSE kuyruğuna tool_start / tool_done olaylari iter.
         """
         _log_activity(
             "info",
@@ -341,23 +345,39 @@ class OllamaClient:
             agent["name"],
         )
 
+        q = _agent_stream_queue.get(agent["id"])
+        if q:
+            await q.put({"type": "tool_start", "name": tool_name, "args": tool_args})
+
         if tool_name == "delegate_to_agent":
             sub_id = tool_args.get("agent_id", "")
             sub_task = tool_args.get("task", "")
             if not sub_id or not sub_task:
-                return "Hata: agent_id ve task zorunlu"
-            sub_agent = next((a for a in AGENTS if a["id"] == sub_id), None)
-            if not sub_agent:
-                return f"Hata: agent bulunamadi: {sub_id}"
-            try:
-                result = await self._send_sub_message(sub_id, sub_task)
-                tc_count = len(result.get("tool_calls") or [])
-                suffix = f"\n[{tc_count} tool kullanildi]" if tc_count else ""
-                return f"=== {result['agent']} yaniti ===\n{result['reply']}{suffix}"
-            except Exception as e:
-                return f"Delege hatasi [{sub_id}]: {e}"
+                result = "Hata: agent_id ve task zorunlu"
+            else:
+                sub_agent = next((a for a in AGENTS if a["id"] == sub_id), None)
+                if not sub_agent:
+                    result = f"Hata: agent bulunamadi: {sub_id}"
+                else:
+                    try:
+                        sub_result = await self._send_sub_message(sub_id, sub_task)
+                        tc_count = len(sub_result.get("tool_calls") or [])
+                        suffix = f"\n[{tc_count} tool kullanildi]" if tc_count else ""
+                        result = f"=== {sub_result['agent']} yaniti ===\n{sub_result['reply']}{suffix}"
+                    except Exception as e:
+                        result = f"Delege hatasi [{sub_id}]: {e}"
+        else:
+            result = await execute_tool(tool_name, tool_args)
 
-        return await execute_tool(tool_name, tool_args)
+        if q:
+            await q.put({
+                "type": "tool_done",
+                "name": tool_name,
+                "args": tool_args,
+                "result": result[:1000],
+            })
+
+        return result
 
     async def _send_sub_message(self, agent_id: str, message: str, max_tokens: int = 1024) -> dict:
         """
@@ -629,6 +649,15 @@ class OllamaClient:
                 agent["name"],
             )
 
+            # SSE kuyruğuna final reply gönder
+            q = _agent_stream_queue.get(agent_id)
+            if q:
+                await q.put({
+                    "type": "reply",
+                    "content": final_reply,
+                    "tool_calls": collected_tool_calls,
+                })
+
             return {
                 "success": True,
                 "reply": final_reply,
@@ -641,7 +670,49 @@ class OllamaClient:
             if _chat_history[agent_id] and _chat_history[agent_id][-1]["role"] == "user":
                 _chat_history[agent_id].pop()
             _log_activity("error", f"Mesaj hatasi -- {agent['name']}", str(e)[:100], agent["name"])
+            q = _agent_stream_queue.get(agent_id)
+            if q:
+                await q.put({"type": "error", "message": str(e)})
             raise RuntimeError(f"Ollama istegi basarisiz: {e}")
+
+    # ── SSE Streaming ─────────────────────────────────────────────────────────
+
+    async def stream_message(self, agent_id: str, message: str, max_tokens: int = 2048):
+        """
+        Async generator — her tool ve final reply için SSE satırı üretir.
+        Frontend EventSource veya fetch stream ile bağlanır.
+        """
+        agent = next((a for a in AGENTS if a["id"] == agent_id), None)
+        if not agent:
+            yield f"data: {json.dumps({'type': 'error', 'message': f'Agent bulunamadi: {agent_id}'})}\n\n"
+            return
+
+        q: asyncio.Queue = asyncio.Queue()
+        _agent_stream_queue[agent_id] = q
+
+        async def _run():
+            try:
+                async with _get_lock(agent_id):
+                    await self._send_message_locked(agent, agent_id, message, max_tokens)
+            except Exception as e:
+                if q:
+                    await q.put({"type": "error", "message": str(e)})
+            finally:
+                _agent_stream_queue[agent_id] = None
+                await q.put({"type": "done"})
+
+        asyncio.create_task(_run())
+
+        while True:
+            try:
+                event = await asyncio.wait_for(q.get(), timeout=30)
+            except asyncio.TimeoutError:
+                yield "data: {\"type\":\"heartbeat\"}\n\n"
+                continue
+
+            yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+            if event.get("type") in ("done", "error"):
+                break
 
     # ── Chat Gecmisi ──────────────────────────────────────────────────────────
 

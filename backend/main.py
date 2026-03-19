@@ -14,6 +14,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from starlette.responses import JSONResponse
 
@@ -143,6 +144,30 @@ async def set_agent_status(agent_id: str, body: SetAgentStatusRequest):
         return await get_ollama().set_agent_status(agent_id, status)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
+
+
+@app.post("/api/agents/{agent_id}/stream")
+async def stream_task_to_agent(agent_id: str, body: SendMessageRequest):
+    """SSE stream: her tool_start/tool_done/reply/done olayını anlık gönderir."""
+    message = body.message
+    if not message:
+        raise HTTPException(status_code=400, detail="'message' alanı gerekli")
+    max_tokens = body.max_tokens or 2048
+    ollama_client = get_ollama()
+
+    async def event_gen():
+        try:
+            async for chunk in ollama_client.stream_message(agent_id, message, max_tokens):
+                yield chunk
+        except Exception as e:
+            import json as _json
+            yield f"data: {_json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+
+    return StreamingResponse(
+        event_gen(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 @app.post("/api/agents/{agent_id}/task")
