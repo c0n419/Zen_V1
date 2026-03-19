@@ -1,13 +1,31 @@
 """
 ZEN v3.0 — Ollama Client
 Ollama OpenAI-uyumlu API üzerinden ZEN agentlarını yönetir.
+Tool calling (ReAct döngüsü) ile agentlar sisteme erişebilir.
 """
 
 import httpx
+import json
 import uuid
 from datetime import datetime, timezone
 
+from tools import TOOL_DEFINITIONS, execute_tool
+
 OLLAMA_BASE_URL = "http://localhost:11434"
+
+_TOOL_GUIDE = (
+    "\n\nSen aşağıdaki araçlara erişebilirsin:\n"
+    "- shell: Bash komutu çalıştır (ls, git, python, systemctl vb.)\n"
+    "- read_file: Dosya oku\n"
+    "- write_file: Dosyaya yaz veya oluştur\n"
+    "- list_dir: Dizin içeriğini listele\n"
+    "- search_files: Dosya içinde metin ara (grep) veya dosya bul (find)\n"
+    "- python_eval: Python kodu çalıştır\n"
+    "- http_request: HTTP isteği gönder\n"
+    "- get_system_info: CPU/RAM/Disk durumu\n"
+    "\nGörevleri yaparken bu araçları aktif olarak kullan. "
+    "Yanıtlar Türkçe olmalı."
+)
 
 AGENTS: list[dict] = [
     {
@@ -19,8 +37,9 @@ AGENTS: list[dict] = [
         "progress": 0,
         "system": (
             "Sen ZEN multi-agent sisteminin baş orchestratörüsün (Smith Protokolü). "
-            "Görevleri analiz eder, diğer agentlara yönlendirirsin. "
-            "Her zaman yapılandırılmış ve Türkçe yanıt verirsin."
+            "Görevleri analiz eder, gerekli araçları kullanarak uygular ve sonuçları raporlarsın. "
+            "Sistem durumunu kontrol et, dosyaları incele, komutları çalıştır."
+            + _TOOL_GUIDE
         ),
     },
     {
@@ -32,7 +51,9 @@ AGENTS: list[dict] = [
         "progress": 0,
         "system": (
             "Sen kod üretimi ve code review konusunda uzmansın (Kanso Protokolü). "
-            "Temiz, okunabilir ve verimli kod yazarsın. Yanıtların her zaman pratik ve özlüdür."
+            "Dosyaları okuyarak analiz eder, kod üretir, testleri çalıştırır ve sonuçları doğrularsın. "
+            "Temiz, okunabilir ve verimli kod yazarsın."
+            + _TOOL_GUIDE
         ),
     },
     {
@@ -44,7 +65,9 @@ AGENTS: list[dict] = [
         "progress": 0,
         "system": (
             "Sen bilgi tabanından bağlamsal bilgi çekiyorsun (Mushin Protokolü). "
-            "KR kurallarını yönetir, geçmişi hatırlar ve ilgili bilgileri sağlarsın."
+            "Dosya sistemini tarayarak ilgili bilgileri bulur, geçmişi analiz eder ve özetlersin. "
+            "Arama araçlarını ve dosya okuma yeteneklerini aktif olarak kullanırsın."
+            + _TOOL_GUIDE
         ),
     },
     {
@@ -56,7 +79,9 @@ AGENTS: list[dict] = [
         "progress": 0,
         "system": (
             "Sen çıktıları kalite açısından doğruluyorsun (Kintsugi Protokolü). "
-            "Hataları düzeltir, eksiklikleri tamamlar ve kalite standartlarını garantilersin."
+            "Kodu çalıştırarak test eder, linter çalıştırır, hataları bulur ve düzeltirsin. "
+            "Kalite standartlarını araçlarla doğrularsın."
+            + _TOOL_GUIDE
         ),
     },
 ]
@@ -140,8 +165,13 @@ class OllamaClient:
         )
         return {"id": agent_id, "status": status}
 
-    async def send_message(self, agent_id: str, message: str, max_tokens: int = 1024) -> dict:
-        """Belirtilen agenta mesaj gönderir, Ollama'dan yanıt alır ve geçmişi saklar."""
+    async def send_message(
+        self, agent_id: str, message: str, max_tokens: int = 2048
+    ) -> dict:
+        """
+        Belirtilen agenta mesaj gönderir.
+        ReAct döngüsü: tool_calls varsa çalıştır → cevapla (max 8 tur).
+        """
         agent = next((a for a in AGENTS if a["id"] == agent_id), None)
         if not agent:
             raise ValueError(f"Agent bulunamadı: {agent_id}")
@@ -153,32 +183,95 @@ class OllamaClient:
         agent["status"] = "processing"
         agent["tasks"] += 1
 
-        # Son 10 mesajı bağlam olarak gönder
+        # Son 10 mesajı bağlam olarak al (rol filtresi: user/assistant)
         history_msgs = [
             {"role": m["role"], "content": m["content"]}
             for m in _chat_history[agent_id][-10:]
             if m["role"] in ("user", "assistant")
         ]
 
-        try:
-            resp = await self.client.post(
-                f"{self.base_url}/v1/chat/completions",
-                json={
-                    "model": self.model,
-                    "messages": [
-                        {"role": "system", "content": agent["system"]},
-                        *history_msgs,
-                    ],
-                    "stream": False,
-                    "max_tokens": max_tokens,
-                },
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            reply = data["choices"][0]["message"]["content"]
+        # ReAct döngüsü için çalışma mesajları (history'den bağımsız)
+        loop_messages: list[dict] = [
+            {"role": "system", "content": agent["system"]},
+            *history_msgs,
+        ]
 
-            # Agent yanıtını geçmişe ekle
-            assistant_msg = {"role": "assistant", "content": reply, "timestamp": _now_iso()}
+        collected_tool_calls: list[dict] = []
+        final_reply = ""
+
+        try:
+            for _turn in range(8):  # max 8 tool-call turu
+                resp = await self.client.post(
+                    f"{self.base_url}/v1/chat/completions",
+                    json={
+                        "model": self.model,
+                        "messages": loop_messages,
+                        "tools": TOOL_DEFINITIONS,
+                        "tool_choice": "auto",
+                        "stream": False,
+                        "max_tokens": max_tokens,
+                    },
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                choice = data["choices"][0]
+                msg = choice["message"]
+                finish = choice.get("finish_reason", "stop")
+
+                # Tool call yok veya stop → son yanıt
+                if finish == "stop" or not msg.get("tool_calls"):
+                    final_reply = msg.get("content") or ""
+                    break
+
+                # ── Tool call'ları çalıştır ────────────────────────────────
+                # Asistan mesajını loop'a ekle (tool_calls ile)
+                loop_messages.append({
+                    "role": "assistant",
+                    "content": msg.get("content") or "",
+                    "tool_calls": msg["tool_calls"],
+                })
+
+                for tc in msg["tool_calls"]:
+                    fn = tc.get("function", {})
+                    tool_name = fn.get("name", "")
+                    try:
+                        tool_args = json.loads(fn.get("arguments", "{}"))
+                    except json.JSONDecodeError:
+                        tool_args = {}
+
+                    _log_activity(
+                        "info",
+                        f"Tool: {tool_name} — {agent['name']}",
+                        str(tool_args)[:80],
+                        agent["name"],
+                    )
+
+                    tool_result = await execute_tool(tool_name, tool_args)
+
+                    collected_tool_calls.append({
+                        "name": tool_name,
+                        "args": tool_args,
+                        "result": tool_result,
+                    })
+
+                    # Tool sonucunu loop'a ekle
+                    loop_messages.append({
+                        "role": "tool",
+                        "tool_call_id": tc.get("id", tool_name),
+                        "content": tool_result,
+                    })
+
+            # Final reply boşsa tool call sonuçlarından özet oluştur
+            if not final_reply and collected_tool_calls:
+                final_reply = "Tool çalıştırma tamamlandı."
+
+            # Agent yanıtını chat geçmişine kaydet
+            assistant_msg = {
+                "role": "assistant",
+                "content": final_reply,
+                "timestamp": _now_iso(),
+                "tool_calls": collected_tool_calls if collected_tool_calls else None,
+            }
             _chat_history[agent_id].append(assistant_msg)
 
             agent["status"] = "active"
@@ -186,32 +279,40 @@ class OllamaClient:
 
             _log_activity(
                 "success",
-                f"Mesaj tamamlandı — {agent['name']}",
-                reply[:100] + ("..." if len(reply) > 100 else ""),
+                f"Tamamlandı — {agent['name']}",
+                final_reply[:100] + ("..." if len(final_reply) > 100 else ""),
                 agent["name"],
             )
-            return {"success": True, "reply": reply, "agent": agent["name"]}
+
+            return {
+                "success": True,
+                "reply": final_reply,
+                "agent": agent["name"],
+                "tool_calls": collected_tool_calls,
+            }
 
         except Exception as e:
             agent["status"] = "error"
-            # Başarısız kullanıcı mesajını da geçmişten çıkar
             if _chat_history[agent_id] and _chat_history[agent_id][-1]["role"] == "user":
                 _chat_history[agent_id].pop()
             _log_activity("error", f"Mesaj hatası — {agent['name']}", str(e)[:100], agent["name"])
             raise RuntimeError(f"Ollama isteği başarısız: {e}")
 
     async def get_chat_history(self, agent_id: str) -> list[dict]:
-        """Agent'ın chat geçmişini döner."""
+        """Agent'ın chat geçmişini döner (tool_calls dahil)."""
         if agent_id not in _chat_history:
             raise ValueError(f"Agent bulunamadı: {agent_id}")
         result = []
         for msg in _chat_history[agent_id]:
-            result.append({
+            entry: dict = {
                 "role": msg["role"],
                 "content": msg["content"],
                 "timestamp": msg["timestamp"],
                 "time": _relative_time(msg["timestamp"]),
-            })
+            }
+            if msg.get("tool_calls"):
+                entry["tool_calls"] = msg["tool_calls"]
+            result.append(entry)
         return result
 
     async def clear_chat_history(self, agent_id: str) -> dict:

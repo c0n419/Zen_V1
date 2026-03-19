@@ -3,7 +3,10 @@ import { Header } from "../components/layout/Header";
 import { BottomNav } from "../components/layout/BottomNav";
 import { GradientCard } from "../components/ui/GradientCard";
 import { motion, AnimatePresence } from "motion/react";
-import { Send, Trash2, Brain, Code, Database, Shield, Loader2 } from "lucide-react";
+import {
+  Send, Trash2, Brain, Code, Database, Shield, Loader2,
+  Terminal, ChevronDown, FileText, FolderOpen, Globe, Cpu,
+} from "lucide-react";
 import {
   getAgentStatus,
   getChatHistory,
@@ -11,6 +14,7 @@ import {
   clearChatHistory,
   type Agent,
   type ChatMessage,
+  type ToolCall,
 } from "../lib/api";
 
 const AGENT_ICONS: Record<string, React.ElementType> = {
@@ -40,6 +44,84 @@ const STATUS_DOT: Record<string, string> = {
   processing: "bg-blue-400 animate-pulse",
   error: "bg-red-400",
 };
+
+// ─── Tool Icons ───────────────────────────────────────────────────────────────
+
+const TOOL_ICON_MAP: Record<string, React.ElementType> = {
+  shell: Terminal,
+  read_file: FileText,
+  write_file: FileText,
+  list_dir: FolderOpen,
+  search_files: Terminal,
+  python_eval: Terminal,
+  http_request: Globe,
+  get_system_info: Cpu,
+};
+
+const TOOL_LABEL_MAP: Record<string, string> = {
+  shell: "Shell",
+  read_file: "Dosya Oku",
+  write_file: "Dosya Yaz",
+  list_dir: "Dizin Listele",
+  search_files: "Dosya Ara",
+  python_eval: "Python",
+  http_request: "HTTP",
+  get_system_info: "Sistem Bilgisi",
+};
+
+function ToolCallBlock({ tc }: { tc: ToolCall }) {
+  const [open, setOpen] = useState(false);
+  const Icon = TOOL_ICON_MAP[tc.name] ?? Terminal;
+  const label = TOOL_LABEL_MAP[tc.name] ?? tc.name;
+
+  // Argümanları okunabilir özet olarak göster
+  const argSummary = Object.entries(tc.args)
+    .map(([k, v]) => `${k}=${typeof v === "string" ? `"${(v as string).slice(0, 40)}"` : JSON.stringify(v)}`)
+    .join("  ");
+
+  return (
+    <div className="mt-2 rounded-lg border border-border/40 bg-black/40 text-xs font-mono overflow-hidden">
+      <button
+        onClick={() => setOpen(!open)}
+        className="w-full flex items-center gap-2 px-3 py-2 hover:bg-white/5 transition-colors text-left"
+      >
+        <Icon className="w-3 h-3 text-cyan-400 flex-shrink-0" />
+        <span className="text-cyan-400 font-semibold">{label}</span>
+        <span className="text-muted-foreground truncate flex-1 opacity-70">{argSummary}</span>
+        <ChevronDown
+          className={`w-3 h-3 text-muted-foreground transition-transform flex-shrink-0 ${open ? "rotate-180" : ""}`}
+        />
+      </button>
+
+      <AnimatePresence>
+        {open && (
+          <motion.div
+            initial={{ height: 0, opacity: 0 }}
+            animate={{ height: "auto", opacity: 1 }}
+            exit={{ height: 0, opacity: 0 }}
+            transition={{ duration: 0.15 }}
+            className="overflow-hidden"
+          >
+            <div className="border-t border-border/30 px-3 py-2 space-y-2">
+              <div>
+                <p className="text-muted-foreground text-[10px] uppercase tracking-wider mb-1">Argümanlar</p>
+                <pre className="text-yellow-300/80 whitespace-pre-wrap break-all">
+                  {JSON.stringify(tc.args, null, 2)}
+                </pre>
+              </div>
+              <div>
+                <p className="text-muted-foreground text-[10px] uppercase tracking-wider mb-1">Çıktı</p>
+                <pre className="text-green-300/80 whitespace-pre-wrap break-all max-h-64 overflow-y-auto">
+                  {tc.result || "(çıktı yok)"}
+                </pre>
+              </div>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+    </div>
+  );
+}
 
 export default function Chat() {
   const [agents, setAgents] = useState<Agent[]>([]);
@@ -98,6 +180,7 @@ export default function Chat() {
         content: result.reply,
         timestamp: new Date().toISOString(),
         time: "şimdi",
+        tool_calls: result.tool_calls,
       };
       setHistory((prev) => [...prev, assistantMsg]);
       // Güncel geçmişi sunucudan çek
@@ -226,12 +309,20 @@ export default function Chat() {
                   className={`flex ${msg.role === "user" ? "justify-end" : "justify-start"}`}
                 >
                   <div
-                    className={`max-w-[80%] rounded-2xl px-4 py-3 text-sm ${
+                    className={`max-w-[85%] rounded-2xl px-4 py-3 text-sm ${
                       msg.role === "user"
                         ? "bg-primary text-primary-foreground rounded-tr-sm"
                         : "bg-background/60 border border-border/50 rounded-tl-sm"
                     }`}
                   >
+                    {/* Tool call'lar — sadece assistant mesajlarında */}
+                    {msg.role === "assistant" && msg.tool_calls && msg.tool_calls.length > 0 && (
+                      <div className="mb-3 space-y-1">
+                        {msg.tool_calls.map((tc, ti) => (
+                          <ToolCallBlock key={ti} tc={tc} />
+                        ))}
+                      </div>
+                    )}
                     <p className="whitespace-pre-wrap leading-relaxed">{msg.content}</p>
                     <p
                       className={`text-xs mt-1 ${
@@ -239,13 +330,18 @@ export default function Chat() {
                       }`}
                     >
                       {msg.time ?? ""}
+                      {msg.role === "assistant" && msg.tool_calls && msg.tool_calls.length > 0 && (
+                        <span className="ml-2 text-cyan-400/60">
+                          · {msg.tool_calls.length} tool
+                        </span>
+                      )}
                     </p>
                   </div>
                 </motion.div>
               ))}
             </AnimatePresence>
 
-            {/* Typing indicator */}
+            {/* Typing / tool execution indicator */}
             {sending && (
               <motion.div
                 initial={{ opacity: 0, y: 10 }}
@@ -253,10 +349,13 @@ export default function Chat() {
                 className="flex justify-start"
               >
                 <div className="bg-background/60 border border-border/50 rounded-2xl rounded-tl-sm px-4 py-3">
-                  <div className="flex items-center gap-1">
-                    <span className="w-2 h-2 rounded-full bg-primary animate-bounce" style={{ animationDelay: "0ms" }} />
-                    <span className="w-2 h-2 rounded-full bg-primary animate-bounce" style={{ animationDelay: "150ms" }} />
-                    <span className="w-2 h-2 rounded-full bg-primary animate-bounce" style={{ animationDelay: "300ms" }} />
+                  <div className="flex items-center gap-2">
+                    <div className="flex items-center gap-1">
+                      <span className="w-2 h-2 rounded-full bg-primary animate-bounce" style={{ animationDelay: "0ms" }} />
+                      <span className="w-2 h-2 rounded-full bg-primary animate-bounce" style={{ animationDelay: "150ms" }} />
+                      <span className="w-2 h-2 rounded-full bg-primary animate-bounce" style={{ animationDelay: "300ms" }} />
+                    </div>
+                    <span className="text-xs text-muted-foreground">Düşünüyor & tool kullanıyor...</span>
                   </div>
                 </div>
               </motion.div>

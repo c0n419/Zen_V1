@@ -58,17 +58,25 @@ export interface DashboardMetrics {
   memoryRules: Metric;
 }
 
+export interface ToolCall {
+  name: string;
+  args: Record<string, unknown>;
+  result: string;
+}
+
 export interface ChatMessage {
   role: "user" | "assistant";
   content: string;
   timestamp: string;
   time?: string;
+  tool_calls?: ToolCall[];
 }
 
 export interface TaskResult {
   success: boolean;
   reply: string;
   agent: string;
+  tool_calls?: ToolCall[];
 }
 
 // ─── Mock Data ────────────────────────────────────────────────────────────────
