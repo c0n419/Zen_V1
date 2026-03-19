@@ -145,10 +145,11 @@ AGENTS: list[dict] = [
             "- Kintsugi Validator'a MUTLAKA kodu calistirip test ettir, sadece review degil.\n"
             "- Sonuclari ozetle: hangi dosyalar olusturuldu, testler gecti mi, hata kaldi mi.\n\n"
             "DELEGASYON KURALLARI:\n"
-            "- Kod yazma/degistirme -> Code Expert\n"
+            "- Kod yazma/degistirme -> Code Expert (max_tokens=8192 kullan)\n"
             "- Bilgi arama/tarama/arastirma -> Memory Retriever\n"
             "- Test/dogrulama/kalite -> Kintsugi Validator\n"
-            "- Sistem komutu/dosya islemi -> direkt shell/read_file/write_file kullan"
+            "- Sistem komutu/dosya islemi -> direkt shell/read_file/write_file kullan\n"
+            "- Code Expert'e karmasik kod gorevi verirken MUTLAKA max_tokens=8192 ekle"
             + _TOOL_INSTRUCTION
         ),
     },
@@ -352,6 +353,7 @@ class OllamaClient:
         if tool_name == "delegate_to_agent":
             sub_id = tool_args.get("agent_id", "")
             sub_task = tool_args.get("task", "")
+            sub_max_tokens = int(tool_args.get("max_tokens", 4096))
             if not sub_id or not sub_task:
                 result = "Hata: agent_id ve task zorunlu"
             else:
@@ -360,7 +362,7 @@ class OllamaClient:
                     result = f"Hata: agent bulunamadi: {sub_id}"
                 else:
                     try:
-                        sub_result = await self._send_sub_message(sub_id, sub_task)
+                        sub_result = await self._send_sub_message(sub_id, sub_task, max_tokens=sub_max_tokens)
                         tc_count = len(sub_result.get("tool_calls") or [])
                         suffix = f"\n[{tc_count} tool kullanildi]" if tc_count else ""
                         result = f"=== {sub_result['agent']} yaniti ===\n{sub_result['reply']}{suffix}"
@@ -379,7 +381,7 @@ class OllamaClient:
 
         return result
 
-    async def _send_sub_message(self, agent_id: str, message: str, max_tokens: int = 1024) -> dict:
+    async def _send_sub_message(self, agent_id: str, message: str, max_tokens: int = 4096) -> dict:
         """
         Sub-agent cagirisi -- delegation olmadan, max 8 tur.
         Chief Agent'in sub-agentlari cagirmasi icin kullanilir.

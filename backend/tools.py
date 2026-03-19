@@ -228,6 +228,10 @@ TOOL_DEFINITIONS = [
                     "task": {
                         "type": "string",
                         "description": "Agenta verilecek görev açıklaması"
+                    },
+                    "max_tokens": {
+                        "type": "integer",
+                        "description": "Agent yanıtı için token bütçesi (varsayılan: 4096, kod yazma görevlerinde 8192 kullan)"
                     }
                 },
                 "required": ["agent_id", "task"]
