@@ -1,0 +1,7 @@
+fastapi
+uvicorn[standard]
+letta
+httpx
+psutil
+GPUtil
+python-dotenv
