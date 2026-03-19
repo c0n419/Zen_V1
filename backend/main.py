@@ -40,7 +40,6 @@ class SetModelRequest(BaseModel):
 
 class SendMessageRequest(BaseModel):
     message: str
-    max_tokens: int | None = 1024
 
 class SetAgentStatusRequest(BaseModel):
     status: str
@@ -152,12 +151,11 @@ async def stream_task_to_agent(agent_id: str, body: SendMessageRequest):
     message = body.message
     if not message:
         raise HTTPException(status_code=400, detail="'message' alanı gerekli")
-    max_tokens = body.max_tokens or 2048
     ollama_client = get_ollama()
 
     async def event_gen():
         try:
-            async for chunk in ollama_client.stream_message(agent_id, message, max_tokens):
+            async for chunk in ollama_client.stream_message(agent_id, message):
                 yield chunk
         except Exception as e:
             import json as _json
@@ -176,9 +174,8 @@ async def send_task_to_agent(agent_id: str, body: SendMessageRequest):
     message = body.message
     if not message:
         raise HTTPException(status_code=400, detail="'message' alanı gerekli")
-    max_tokens = body.max_tokens or 1024
     try:
-        return await get_ollama().send_message(agent_id, message, max_tokens=max_tokens)
+        return await get_ollama().send_message(agent_id, message)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:

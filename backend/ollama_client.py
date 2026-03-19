@@ -145,11 +145,10 @@ AGENTS: list[dict] = [
             "- Kintsugi Validator'a MUTLAKA kodu calistirip test ettir, sadece review degil.\n"
             "- Sonuclari ozetle: hangi dosyalar olusturuldu, testler gecti mi, hata kaldi mi.\n\n"
             "DELEGASYON KURALLARI:\n"
-            "- Kod yazma/degistirme -> Code Expert (max_tokens=8192 kullan)\n"
+            "- Kod yazma/degistirme -> Code Expert\n"
             "- Bilgi arama/tarama/arastirma -> Memory Retriever\n"
             "- Test/dogrulama/kalite -> Kintsugi Validator\n"
-            "- Sistem komutu/dosya islemi -> direkt shell/read_file/write_file kullan\n"
-            "- Code Expert'e karmasik kod gorevi verirken MUTLAKA max_tokens=8192 ekle"
+            "- Sistem komutu/dosya islemi -> direkt shell/read_file/write_file kullan"
             + _TOOL_INSTRUCTION
         ),
     },
@@ -353,7 +352,6 @@ class OllamaClient:
         if tool_name == "delegate_to_agent":
             sub_id = tool_args.get("agent_id", "")
             sub_task = tool_args.get("task", "")
-            sub_max_tokens = int(tool_args.get("max_tokens", 4096))
             if not sub_id or not sub_task:
                 result = "Hata: agent_id ve task zorunlu"
             else:
@@ -362,7 +360,7 @@ class OllamaClient:
                     result = f"Hata: agent bulunamadi: {sub_id}"
                 else:
                     try:
-                        sub_result = await self._send_sub_message(sub_id, sub_task, max_tokens=sub_max_tokens)
+                        sub_result = await self._send_sub_message(sub_id, sub_task)
                         tc_count = len(sub_result.get("tool_calls") or [])
                         suffix = f"\n[{tc_count} tool kullanildi]" if tc_count else ""
                         result = f"=== {sub_result['agent']} yaniti ===\n{sub_result['reply']}{suffix}"
@@ -381,20 +379,19 @@ class OllamaClient:
 
         return result
 
-    async def _send_sub_message(self, agent_id: str, message: str, max_tokens: int = 4096) -> dict:
+    async def _send_sub_message(self, agent_id: str, message: str, max_tokens: int = 0) -> dict:
         """
         Sub-agent cagirisi -- delegation olmadan, max 8 tur.
-        Chief Agent'in sub-agentlari cagirmasi icin kullanilir.
-        Ayni agent'a esz zamanli istekleri lock ile seriallastirir.
+        max_tokens=0 → Ollama'ya gönderilmez, model kendi EOS'una kadar üretir.
         """
         agent = next((a for a in AGENTS if a["id"] == agent_id), None)
         if not agent:
             raise ValueError(f"Sub-agent bulunamadi: {agent_id}")
 
         async with _get_lock(agent_id):
-            return await self._send_sub_message_locked(agent, agent_id, message, max_tokens)
+            return await self._send_sub_message_locked(agent, agent_id, message)
 
-    async def _send_sub_message_locked(self, agent: dict, agent_id: str, message: str, max_tokens: int) -> dict:
+    async def _send_sub_message_locked(self, agent: dict, agent_id: str, message: str) -> dict:
         agent["status"] = "processing"
         agent["tasks"] += 1
 
@@ -418,7 +415,7 @@ class OllamaClient:
         final_reply = ""
         last_content = ""
 
-        for _turn in range(8):  # 6'dan 8'e çıkarıldı
+        for _turn in range(8):
             resp = await self.client.post(
                 f"{self.base_url}/v1/chat/completions",
                 json={
@@ -427,7 +424,6 @@ class OllamaClient:
                     "tools": sub_tools,
                     "tool_choice": "auto",
                     "stream": False,
-                    "max_tokens": max_tokens,
                 },
             )
             resp.raise_for_status()
@@ -489,12 +485,13 @@ class OllamaClient:
 
     # ── Ana mesajlasma (ReAct dongusu) ────────────────────────────────────────
 
-    async def send_message(self, agent_id: str, message: str, max_tokens: int = 2048) -> dict:
+    async def send_message(self, agent_id: str, message: str, max_tokens: int = 0) -> dict:
         """
         Agenta mesaj gonderir. ReAct dongusu (max 15 tur):
           1. Native tool_calls -> calistir (delegate_to_agent dahil)
           2. Text-based fallback -> TOOL: satirlari parse edip calistir
           3. Max tur sonrasi ozet istegi
+        max_tokens=0 → Ollama'ya gönderilmez, model kendi EOS'una kadar üretir.
         Ayni agent'a esz zamanli istekleri lock ile seriallastirir.
         """
         agent = next((a for a in AGENTS if a["id"] == agent_id), None)
@@ -502,9 +499,9 @@ class OllamaClient:
             raise ValueError(f"Agent bulunamadi: {agent_id}")
 
         async with _get_lock(agent_id):
-            return await self._send_message_locked(agent, agent_id, message, max_tokens)
+            return await self._send_message_locked(agent, agent_id, message)
 
-    async def _send_message_locked(self, agent: dict, agent_id: str, message: str, max_tokens: int) -> dict:
+    async def _send_message_locked(self, agent: dict, agent_id: str, message: str) -> dict:
         user_msg = {"role": "user", "content": message, "timestamp": _now_iso()}
         _chat_history[agent_id].append(user_msg)
 
@@ -528,7 +525,7 @@ class OllamaClient:
         last_content = ""
 
         try:
-            for _turn in range(15):  # 12'den 15'e çıkarıldı
+            for _turn in range(15):
                 resp = await self.client.post(
                     f"{self.base_url}/v1/chat/completions",
                     json={
@@ -537,7 +534,6 @@ class OllamaClient:
                         "tools": TOOL_DEFINITIONS,
                         "tool_choice": "auto",
                         "stream": False,
-                        "max_tokens": max_tokens,
                     },
                 )
                 resp.raise_for_status()
@@ -679,7 +675,7 @@ class OllamaClient:
 
     # ── SSE Streaming ─────────────────────────────────────────────────────────
 
-    async def stream_message(self, agent_id: str, message: str, max_tokens: int = 2048):
+    async def stream_message(self, agent_id: str, message: str, max_tokens: int = 0):
         """
         Async generator — her tool ve final reply için SSE satırı üretir.
         Frontend EventSource veya fetch stream ile bağlanır.
@@ -695,7 +691,7 @@ class OllamaClient:
         async def _run():
             try:
                 async with _get_lock(agent_id):
-                    await self._send_message_locked(agent, agent_id, message, max_tokens)
+                    await self._send_message_locked(agent, agent_id, message)
             except Exception as e:
                 if q:
                     await q.put({"type": "error", "message": str(e)})
