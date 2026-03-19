@@ -206,6 +206,33 @@ TOOL_DEFINITIONS = [
                 }
             }
         }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "delegate_to_agent",
+            "description": (
+                "Görevi uzman bir ZEN agentına delege et ve yanıtı al. "
+                "Kod analizi/üretimi için Code Expert, bilgi tarama için Memory Retriever, "
+                "kalite doğrulama için Kintsugi Validator kullan. "
+                "Her karmaşık görevde ilgili uzman agentlara delege et."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "agent_id": {
+                        "type": "string",
+                        "description": "Hedef agent ID",
+                        "enum": ["agent-code-002", "agent-mem-003", "agent-val-004"]
+                    },
+                    "task": {
+                        "type": "string",
+                        "description": "Agenta verilecek görev açıklaması"
+                    }
+                },
+                "required": ["agent_id", "task"]
+            }
+        }
     }
 ]
 
