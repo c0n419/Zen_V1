@@ -56,7 +56,31 @@ app.add_middleware(
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "ollama": OLLAMA_BASE_URL, "model": OLLAMA_MODEL}
+    return {"status": "ok", "ollama": OLLAMA_BASE_URL, "model": ollama.get_current_model()}
+
+
+# ─── Model Yönetimi ───────────────────────────────────────────────────────────
+
+@app.get("/api/models")
+async def list_models():
+    """Ollama'daki mevcut modelleri listeler."""
+    return await ollama.list_models()
+
+
+@app.get("/api/config")
+async def get_config():
+    """Mevcut konfigürasyonu döner."""
+    return {"model": ollama.get_current_model(), "ollama": OLLAMA_BASE_URL}
+
+
+@app.patch("/api/config/model")
+async def set_model(body: dict):
+    """Aktif modeli değiştirir: {model: 'model_adı'}"""
+    model = body.get("model", "").strip()
+    if not model:
+        raise HTTPException(status_code=400, detail="'model' alanı gerekli")
+    ollama.set_model(model)
+    return {"model": model, "status": "ok"}
 
 
 # ─── Agents ──────────────────────────────────────────────────────────────────

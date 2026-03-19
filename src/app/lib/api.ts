@@ -79,6 +79,13 @@ export interface TaskResult {
   tool_calls?: ToolCall[];
 }
 
+export interface OllamaModel {
+  name: string;
+  size: number;
+  modified: string;
+  active: boolean;
+}
+
 // ─── Mock Data ────────────────────────────────────────────────────────────────
 
 const MOCK_AGENTS: Agent[] = [
@@ -194,6 +201,27 @@ export async function getTaskDistribution(): Promise<TaskDistributionData[]> {
 export async function getSystemMetrics(): Promise<SystemMetrics> {
   if (MOCK_ENABLED) return mockDelay(MOCK_SYSTEM);
   return apiFetch<SystemMetrics>("/system/metrics");
+}
+
+// ─── Model Yönetimi ──────────────────────────────────────────────────────────
+
+export async function getAvailableModels(): Promise<OllamaModel[]> {
+  if (MOCK_ENABLED) return mockDelay([{ name: "rnj-1:8b", size: 0, modified: "", active: true }]);
+  return apiFetch<OllamaModel[]>("/models");
+}
+
+export async function getConfig(): Promise<{ model: string; ollama: string }> {
+  if (MOCK_ENABLED) return mockDelay({ model: "rnj-1:8b", ollama: "http://localhost:11434" });
+  return apiFetch("/config");
+}
+
+export async function setActiveModel(model: string): Promise<{ model: string; status: string }> {
+  if (MOCK_ENABLED) return mockDelay({ model, status: "ok" });
+  return apiFetch("/config/model", {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ model }),
+  });
 }
 
 // ─── WebSocket ────────────────────────────────────────────────────────────────

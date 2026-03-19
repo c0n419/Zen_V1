@@ -12,9 +12,13 @@ import {
   getChatHistory,
   sendTaskToAgent,
   clearChatHistory,
+  getAvailableModels,
+  getConfig,
+  setActiveModel,
   type Agent,
   type ChatMessage,
   type ToolCall,
+  type OllamaModel,
 } from "../lib/api";
 
 const AGENT_ICONS: Record<string, React.ElementType> = {
@@ -130,15 +134,35 @@ export default function Chat() {
   const [input, setInput] = useState("");
   const [sending, setSending] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [models, setModels] = useState<OllamaModel[]>([]);
+  const [activeModel, setActiveModelState] = useState<string>("");
+  const [modelOpen, setModelOpen] = useState(false);
+  const [modelChanging, setModelChanging] = useState(false);
   const bottomRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
 
-  // Agent listesini yükle
+  // Agent listesi + model listesi yükle
   useEffect(() => {
     getAgentStatus().then(setAgents).catch(() => {});
+    getAvailableModels().then(setModels).catch(() => {});
+    getConfig().then((c) => setActiveModelState(c.model)).catch(() => {});
     const iv = setInterval(() => getAgentStatus().then(setAgents).catch(() => {}), 10_000);
     return () => clearInterval(iv);
   }, []);
+
+  async function handleModelChange(modelName: string) {
+    setModelChanging(true);
+    try {
+      await setActiveModel(modelName);
+      setActiveModelState(modelName);
+      setModels((prev) => prev.map((m) => ({ ...m, active: m.name === modelName })));
+    } catch {
+      // ignore
+    } finally {
+      setModelChanging(false);
+      setModelOpen(false);
+    }
+  }
 
   // Seçilen agentın chat geçmişini yükle
   useEffect(() => {
@@ -396,9 +420,59 @@ export default function Chat() {
                 )}
               </button>
             </div>
-            <p className="text-xs text-muted-foreground mt-2 text-center">
-              Model: <span className="text-primary font-mono">rnj-1:8b</span> • Yerel Ollama
-            </p>
+
+            {/* Model Seçici */}
+            <div className="flex items-center justify-between mt-2">
+              <div className="relative">
+                <button
+                  onClick={() => setModelOpen(!modelOpen)}
+                  disabled={modelChanging}
+                  className="flex items-center gap-1.5 text-xs text-muted-foreground hover:text-foreground transition-colors disabled:opacity-50"
+                >
+                  <Cpu className="w-3 h-3" />
+                  <span className="font-mono text-primary truncate max-w-40">{activeModel || "—"}</span>
+                  <ChevronDown className={`w-3 h-3 transition-transform ${modelOpen ? "rotate-180" : ""}`} />
+                </button>
+
+                <AnimatePresence>
+                  {modelOpen && models.length > 0 && (
+                    <motion.div
+                      initial={{ opacity: 0, y: 4, scale: 0.97 }}
+                      animate={{ opacity: 1, y: 0, scale: 1 }}
+                      exit={{ opacity: 0, y: 4, scale: 0.97 }}
+                      transition={{ duration: 0.12 }}
+                      className="absolute bottom-full mb-2 left-0 z-50 w-72 bg-card border border-border rounded-xl shadow-2xl overflow-hidden"
+                    >
+                      <div className="px-3 py-2 border-b border-border/50">
+                        <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wider">Model Seç</p>
+                      </div>
+                      <div className="max-h-64 overflow-y-auto">
+                        {models.map((m) => (
+                          <button
+                            key={m.name}
+                            onClick={() => handleModelChange(m.name)}
+                            className={`w-full flex items-center justify-between px-3 py-2.5 hover:bg-muted/50 transition-colors text-left ${
+                              m.active ? "bg-primary/10" : ""
+                            }`}
+                          >
+                            <div>
+                              <p className={`text-sm font-mono ${m.active ? "text-primary" : ""}`}>{m.name}</p>
+                              {m.size > 0 && (
+                                <p className="text-xs text-muted-foreground">
+                                  {(m.size / 1024 / 1024 / 1024).toFixed(1)} GB
+                                </p>
+                              )}
+                            </div>
+                            {m.active && <span className="w-2 h-2 rounded-full bg-green-400" />}
+                          </button>
+                        ))}
+                      </div>
+                    </motion.div>
+                  )}
+                </AnimatePresence>
+              </div>
+              <p className="text-xs text-muted-foreground">Yerel Ollama • 8 tool aktif</p>
+            </div>
           </div>
         </GradientCard>
       </main>
