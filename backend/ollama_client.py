@@ -8,6 +8,8 @@ Tool calling:
  3. delegate_to_agent -- Chief Agent'in sub-agentlara gorev delege etmesi
 """
 
+import asyncio
+import os
 import re
 import json
 import httpx
@@ -24,6 +26,47 @@ OLLAMA_BASE_URL: str = "http://localhost:11434"
 # Proje dizinleri (sub-agentlara bildirilir)
 _PROJECT_DIR = "/home/ninja/İndirilenler/zen_dash"
 _BACKEND_DIR = _PROJECT_DIR + "/backend"
+_ENV_PATH = _BACKEND_DIR + "/.env"
+
+# History sınırı — bellek tüketimini önler
+MAX_HISTORY = 100
+
+# Agent başına kilit — eş zamanlı istek karışıklığını önler
+_agent_locks: dict[str, asyncio.Lock] = {}
+
+
+def _get_lock(agent_id: str) -> asyncio.Lock:
+    if agent_id not in _agent_locks:
+        _agent_locks[agent_id] = asyncio.Lock()
+    return _agent_locks[agent_id]
+
+
+def _persist_model(model_name: str) -> None:
+    """Model değişikliğini .env dosyasına yazar — restart'ta kaybolmasın."""
+    try:
+        lines: list[str] = []
+        found = False
+        if os.path.exists(_ENV_PATH):
+            with open(_ENV_PATH, "r", encoding="utf-8") as f:
+                for line in f:
+                    if line.startswith("OLLAMA_MODEL="):
+                        lines.append(f"OLLAMA_MODEL={model_name}\n")
+                        found = True
+                    else:
+                        lines.append(line)
+        if not found:
+            lines.append(f"OLLAMA_MODEL={model_name}\n")
+        with open(_ENV_PATH, "w", encoding="utf-8") as f:
+            f.writelines(lines)
+    except Exception:
+        pass
+
+
+def _trim_history(agent_id: str) -> None:
+    """History MAX_HISTORY limitini aşarsa en eski mesajları siler."""
+    h = _chat_history[agent_id]
+    if len(h) > MAX_HISTORY:
+        _chat_history[agent_id] = h[-MAX_HISTORY:]
 
 
 # ── Text-based tool call parser ───────────────────────────────────────────────
@@ -70,7 +113,9 @@ _TOOL_INSTRUCTION = (
     "      agent-val-004  (Kintsugi Validator) -> kalite kontrolu, dogrulama\n\n"
     "DELEGE KURALI (Chief Agent): Karmasik gorevlerde ilgili uzmana delege et.\n"
     "KURAL: Kullaniciya komut ONERME -- araclari kendin kullan.\n"
-    "PAKET: which apt||which dnf||which yum ile paket yoneticisini tespit et.\n\n"
+    "PAKET: which apt||which dnf||which yum ile paket yoneticisini tespit et.\n"
+    "DEPOLAMA: Kalici dosyalar icin ~/zen_projects/ veya proje dizinini kullan. "
+    "/tmp gecicidir, sistem restart'inda silinir.\n\n"
     "ARAC FORMATI (her arac ayri satirda):\n"
     "TOOL: arac_adi {\"arg\": \"deger\"}\n\n"
     "Ornekler:\n"
@@ -249,6 +294,7 @@ class OllamaClient:
         global CURRENT_MODEL
         self.model = model_name
         CURRENT_MODEL = model_name
+        _persist_model(model_name)
         _log_activity("info", f"Model degisti -> {model_name}", "", "Sistem")
 
     def get_current_model(self) -> str:
@@ -313,21 +359,27 @@ class OllamaClient:
 
         return await execute_tool(tool_name, tool_args)
 
-    async def _send_sub_message(self, agent_id: str, message: str, max_tokens: int = 512) -> dict:
+    async def _send_sub_message(self, agent_id: str, message: str, max_tokens: int = 1024) -> dict:
         """
-        Sub-agent cagirisi -- delegation olmadan, max 6 tur, hizli.
+        Sub-agent cagirisi -- delegation olmadan, max 8 tur.
         Chief Agent'in sub-agentlari cagirmasi icin kullanilir.
+        Ayni agent'a esz zamanli istekleri lock ile seriallastirir.
         """
         agent = next((a for a in AGENTS if a["id"] == agent_id), None)
         if not agent:
             raise ValueError(f"Sub-agent bulunamadi: {agent_id}")
 
+        async with _get_lock(agent_id):
+            return await self._send_sub_message_locked(agent, agent_id, message, max_tokens)
+
+    async def _send_sub_message_locked(self, agent: dict, agent_id: str, message: str, max_tokens: int) -> dict:
         agent["status"] = "processing"
         agent["tasks"] += 1
 
+        # Son 8 mesaj — daha geniş bağlam (önceki 4'ten artırıldı)
         history_msgs = [
             {"role": m["role"], "content": m["content"]}
-            for m in _chat_history[agent_id][-4:]
+            for m in _chat_history[agent_id][-8:]
             if m["role"] in ("user", "assistant")
         ]
 
@@ -344,7 +396,7 @@ class OllamaClient:
         final_reply = ""
         last_content = ""
 
-        for _turn in range(6):
+        for _turn in range(8):  # 6'dan 8'e çıkarıldı
             resp = await self.client.post(
                 f"{self.base_url}/v1/chat/completions",
                 json={
@@ -399,12 +451,13 @@ class OllamaClient:
         if not final_reply:
             final_reply = last_content or "Islem tamamlandi."
 
-        # Sub-agent gecmisine kaydet
+        # Sub-agent gecmisine kaydet + history limitini uygula
         _chat_history[agent_id].append({"role": "user", "content": message, "timestamp": _now_iso()})
         sub_msg: dict = {"role": "assistant", "content": final_reply, "timestamp": _now_iso()}
         if collected_tool_calls:
             sub_msg["tool_calls"] = collected_tool_calls
         _chat_history[agent_id].append(sub_msg)
+        _trim_history(agent_id)
 
         agent["status"] = "active"
         agent["progress"] = min(100, agent["progress"] + 5)
@@ -416,24 +469,30 @@ class OllamaClient:
 
     async def send_message(self, agent_id: str, message: str, max_tokens: int = 2048) -> dict:
         """
-        Agenta mesaj gonderir. ReAct dongusu (max 12 tur):
+        Agenta mesaj gonderir. ReAct dongusu (max 15 tur):
           1. Native tool_calls -> calistir (delegate_to_agent dahil)
           2. Text-based fallback -> TOOL: satirlari parse edip calistir
           3. Max tur sonrasi ozet istegi
+        Ayni agent'a esz zamanli istekleri lock ile seriallastirir.
         """
         agent = next((a for a in AGENTS if a["id"] == agent_id), None)
         if not agent:
             raise ValueError(f"Agent bulunamadi: {agent_id}")
 
+        async with _get_lock(agent_id):
+            return await self._send_message_locked(agent, agent_id, message, max_tokens)
+
+    async def _send_message_locked(self, agent: dict, agent_id: str, message: str, max_tokens: int) -> dict:
         user_msg = {"role": "user", "content": message, "timestamp": _now_iso()}
         _chat_history[agent_id].append(user_msg)
 
         agent["status"] = "processing"
         agent["tasks"] += 1
 
+        # Son 12 mesaj — önceki 10'dan artırıldı
         history_msgs = [
             {"role": m["role"], "content": m["content"]}
-            for m in _chat_history[agent_id][-10:]
+            for m in _chat_history[agent_id][-12:]
             if m["role"] in ("user", "assistant")
         ]
 
@@ -447,7 +506,7 @@ class OllamaClient:
         last_content = ""
 
         try:
-            for _turn in range(12):
+            for _turn in range(15):  # 12'den 15'e çıkarıldı
                 resp = await self.client.post(
                     f"{self.base_url}/v1/chat/completions",
                     json={
@@ -558,6 +617,7 @@ class OllamaClient:
             if collected_tool_calls:
                 assistant_msg["tool_calls"] = collected_tool_calls
             _chat_history[agent_id].append(assistant_msg)
+            _trim_history(agent_id)
 
             agent["status"] = "active"
             agent["progress"] = min(100, agent["progress"] + 5)
